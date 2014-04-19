@@ -1,0 +1,166 @@
+#!/bin/bash
+#
+# Copyright 2009 Red Hat, Inc. and/or its affiliates.
+# Released under the GPL
+#
+# Author:      Dan Kenigsberg <danken@redhat.com>
+#
+# ksmtuned - a simple script that controls whether (and with what vigor) ksm
+# should search for duplicated pages.
+#
+# starts ksm when memory commited to qemu processes exceeds a threshold, and
+# make ksm work harder and harder untill memory load falls below that
+# threshold.
+#
+# send SIGUSR1 to this process right after a new qemu process is started, or
+# following its death, to retune ksm accordingly
+#
+# needs testing and ironing. contact danken@redhat.com if something breaks.
+
+#check whether file exist or not
+if [ -f /etc/ksmfinetuned.conf ]; then
+    . /etc/ksmfinetuned.conf
+fi
+
+#debug function used whenever we want to print debug info into specified file. data are printed using $*.
+debug() {
+    if [ -n "$DEBUG" ]; then
+        s="`/bin/date`: $*"
+        [ -n "$LOGFILE" ] && echo "$s" >> "$LOGFILE" || echo "$s"
+    fi
+}
+
+#assigns parameters.
+KSM_MONITOR_INTERVAL=${KSM_MONITOR_INTERVAL:-60}
+KSM_NPAGES_BOOST_SOFT=${KSM_NPAGES_BOOST:-150}
+KSM_NPAGES_DECAY_SOFT=${KSM_NPAGES_DECAY:--30}
+KSM_NPAGES_BOOST_HARD=${KSM_NPAGES_BOOST:-300}
+KSM_NPAGES_DECAY_HARD=${KSM_NPAGES_DECAY:--50}
+
+KSM_NPAGES_MIN=${KSM_NPAGES_MIN:-64}
+KSM_NPAGES_MAX=${KSM_NPAGES_MAX:-1250}
+# millisecond sleep between ksm scans for 16Gb server. Smaller servers sleep
+# more, bigger sleep less.
+KSM_SLEEP_MSEC=${KSM_SLEEP_MSEC:-10}
+
+KSM_THRES_COEF_SOFT=${KSM_THRES_COEF:-25}
+KSM_THRES_COEF_HARD=${KSM_THRES_COEF:-15}
+KSM_THRES_CONST=${KSM_THRES_CONST:-2048}
+
+#what is actual physical memory capacity.
+total=`awk '/^MemTotal:/ {print $2}' /proc/meminfo`
+#print total memory into log-file.
+debug total $total
+npages=0
+sleep=$[KSM_SLEEP_MSEC * 16 * 1024 * 1024 / total]
+#ensure that if the sleep value is less than 10ms then set sleep to 10ms.
+[ $sleep -le 10 ] && sleep=10
+debug sleep $sleep
+thres_soft=$[total * KSM_THRES_COEF_SOFT / 100]
+thres_hard=$[total * KSM_THRES_COEF_HARD / 100]
+thres_soft_free=$[total - thres_soft]
+thres_hard_free=$[total - thres_hard]
+#ensure that if the thres it-self less than the thresold then set it to thresold value.
+if [ $KSM_THRES_CONST -gt $thres_soft ]; then
+    thres_soft=$KSM_THRES_CONST
+    thres_hard=$KSM_THRES_CONST
+fi
+debug thres_soft $thres_soft
+debug thres_hard $thres_hard
+
+#function which starts or stops the ksm.
+KSMCTL () {
+    case x$1 in
+        xstop)
+            echo 0 > /sys/kernel/mm/ksm/run
+            ;;
+        xstart)
+            echo $2 > /sys/kernel/mm/ksm/pages_to_scan
+            echo $3 > /sys/kernel/mm/ksm/sleep_millisecs
+            echo 1 > /sys/kernel/mm/ksm/run
+            ;;
+    esac
+}
+
+#returns the occupied/committed memory by guests (kvm-processes).
+committed_memory () {
+    # calculate how much memory is committed to running qemu processes
+    local progname
+    progname=${1:-kvm}
+    ps -C "$progname" -o rss | awk '{ sum += $1 }; END { print sum }'
+}
+
+#returns the currently available free physical memory.
+free_memory () {
+    awk '/^(MemFree|Buffers|Cached):/ {free += $2}; END {print free}' /proc/meminfo
+}
+
+increase_npages() {
+    local delta
+#below one assign the value of $1(if exist,otherwise 0) to delta 
+    delta=${1:-0}
+    npages=$[npages + delta]
+    if [ $npages -lt $KSM_NPAGES_MIN ]; then
+        npages=$KSM_NPAGES_MIN
+    elif [ $npages -gt $KSM_NPAGES_MAX ]; then
+        npages=$KSM_NPAGES_MAX
+    fi
+    echo $npages
+}
+
+#main logic for increasing or decreasing the number of pages to scan.
+adjust () {
+    local free committed
+    free=`free_memory`
+    committed=`committed_memory`
+    debug committed $committed free $free
+#thres_soft > thres_hard
+    if [ $[committed + thres_soft] -lt $total -a $free -gt $thres_soft ]; then
+        KSMCTL stop
+        debug "$[committed + thres_soft] < $total and free > $thres_soft, stop ksm"
+        return 1
+    fi
+    debug "$[committed + thres_soft] > $total, start ksm"
+    if [ $free -lt $thres_hard ]; then
+        #hard limit
+        npages=`increase_npages $KSM_NPAGES_BOOST_HARD`
+        debug "$free < $thres_hard, boost_hard"
+    elif [ $free -lt $thres_soft ]; then
+        #soft limit
+        npages=`increase_npages $KSM_NPAGES_BOOST_SOFT`
+        debug "$free < $thres_soft, boost_soft"
+#    elif [[ $free < $thres_hard_free && $free > $thres_soft_free ]]; then #if free memory is lying between soft_limit and hard_limit(means 75%-85% memory is free) then decay softly.
+#        npages=`increase_npages $KSM_NPAGES_DECAY_SOFT`
+#        debug "$free < $thres_hard_free and  $free > $thres_soft_free, decay_soft"
+#    elif [ $free -gt $thres_hard_free ]; then
+    else
+        npages=`increase_npages $KSM_NPAGES_DECAY_HARD`
+        debug "$free > $thres_hard_free, decay_hard"
+    fi
+
+    KSMCTL start $npages $sleep
+    debug "KSMCTL start $npages $sleep"
+    return 0
+}
+
+
+#below code do not need to change.
+function nothing () {
+    :
+}
+
+loop () {
+    trap nothing SIGUSR1
+    while true
+    do
+        sleep $KSM_MONITOR_INTERVAL &
+        wait $!
+        adjust
+    done
+}
+
+PIDFILE=${PIDFILE-/var/run/ksmtune.pid}
+if touch "$PIDFILE"; then
+  loop &
+  echo $! > "$PIDFILE"
+fi
